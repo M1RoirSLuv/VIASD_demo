@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "via-sd"
+version = "0.1.0"
+description = "Verification via Intra-Model Routing for Speculative Decoding"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21"]
+
+[project.optional-dependencies]
+torch = [
+    "torch>=2.0",
+    "transformers>=4.42.0",
+    "accelerate",
+    "sentencepiece",
+    "protobuf",
+    "bayesian-optimization>=1.4.0",
+    "scikit-learn",
+]
+eval = [
+    "datasets",
+    "tqdm",
+    "shortuuid",
+]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "torch: requires PyTorch",
+    "gpu: requires GPU and model weights",
+]
