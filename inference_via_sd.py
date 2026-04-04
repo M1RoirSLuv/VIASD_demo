@@ -25,23 +25,21 @@ Usage (standalone):
 import argparse
 import functools
 import logging
-import os
-import sys
 
 import torch
 
-# ── path setup ────────────────────────────────────────────────────────────────
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
-
-from via_sd_project.via_sd.torch.model_loading import (
+from via_sd.torch.model_loading import (
     _detect_model_family,
     init_kv_cache,
     load_gemma2_swift,
     load_llama_swift,
 )
-from via_sd_project.via_sd.models.swift_utils import layer_random_search, reset_swift_mode
+from via_sd.models.swift_utils import (
+    get_next_point_to_probe,
+    layer_bayes_search,
+    layer_random_search,
+    reset_swift_mode,
+)
 
 # ── dtype helper ───────────────────────────────────────────────────────────────
 _DTYPE_MAP = {
@@ -99,6 +97,50 @@ def _three_tier_target(
     if denom > 1e-9:
         target = target / denom
     return target
+
+
+def _multi_tier_target(
+    mid_probs_list: list,      # [q'1, q'2, ...], each [V]
+    full_probs: torch.Tensor,  # [V]
+    draft_probs: torch.Tensor, # [V]
+    alphas: list,              # thresholds for each middle tier
+) -> torch.Tensor:
+    """Generalized hierarchical target for 4/5-layer VIA-SD.
+
+    Policy:
+      for i-th middle tier q'_i:
+        if q'_i is confident, pick source_i
+      where source_0=draft, source_i=q'_{i-1}.
+      remaining tokens fallback to full verifier q.
+    """
+    if not mid_probs_list:
+        return full_probs
+    if len(mid_probs_list) == 1:
+        # Keep paper-default 3-tier behavior when only one middle tier exists.
+        a1 = alphas[0] if len(alphas) > 0 else 0.5
+        a2 = alphas[1] if len(alphas) > 1 else 0.3
+        return _three_tier_target(mid_probs_list[0], full_probs, draft_probs, a1, a2)
+
+    target = torch.zeros_like(full_probs)
+    remaining = torch.ones_like(full_probs)
+    sources = [draft_probs] + mid_probs_list[:-1]
+    for i, gate_probs in enumerate(mid_probs_list):
+        alpha_i = alphas[min(i, len(alphas) - 1)] if alphas else 0.3
+        thresh = (1.0 - alpha_i) * gate_probs.max()
+        mask = (gate_probs >= thresh).float() * remaining
+        target += mask * sources[i]
+        remaining = remaining * (1.0 - mask)
+    target += remaining * full_probs
+    denom = target.sum()
+    if denom > 1e-9:
+        target = target / denom
+    return target
+
+
+def _parse_comma_floats(s: str):
+    if s is None or s == "":
+        return []
+    return [float(x.strip()) for x in s.split(",") if x.strip()]
 
 
 def _truncate_hf_pkv(pkv, target_seq_len: int):
@@ -166,6 +208,8 @@ def via_sd_forward(
     logits_processor=None,       # None → greedy only
     max_steps: int = 512,
     num_tiers: int = 3,          # 2=standard SD, 3=VIA-SD
+    alpha_list=None,             # for >=4 tiers
+    tier_skip_configs=None,      # list[(attn_skip, mlp_skip)] for middle tiers
 ):
     """
     VIA-SD three-tier speculative decoding.
@@ -184,25 +228,36 @@ def via_sd_forward(
     """
     assert input_ids.shape[0] == 1, "Only batch_size=1 supported"
     assert logits_processor is None, "Only greedy decoding (temperature=0) supported"
+    assert num_tiers >= 2, "num_tiers must be >=2"
 
     device = next(model.parameters()).device
     input_ids = input_ids.clone().to(device)
     eos_id = tokenizer.eos_token_id
+    n_mid_tiers = max(0, num_tiers - 2)
+    alpha_list = alpha_list or [alpha1, alpha2, 0.2, 0.1]
+    tier_skip_configs = tier_skip_configs or []
 
     # ── Initialize KV caches ──────────────────────────────────────────────────
     reset_swift_mode(model)
     full_pkv, _, full_len_data = init_kv_cache(model)
-    if num_tiers >= 3:
-        slim_pkv, _, slim_len_data = init_kv_cache(model)
+    mid_pkv_list = []
+    mid_len_data_list = []
+    for _ in range(n_mid_tiers):
+        mid_pkv, _, mid_len_data = init_kv_cache(model)
+        mid_pkv_list.append(mid_pkv)
+        mid_len_data_list.append(mid_len_data)
 
     # ── Prefill all models on the prompt ──────────────────────────────────────
     with torch.inference_mode():
         full_pre = _model_forward(model, input_ids, full_pkv, slim_mode=False)
         prev_full_logit = full_pre[-1].clone()          # [V]
 
-        if num_tiers >= 3:
-            slim_pre = _model_forward(model, input_ids, slim_pkv, slim_mode=True)
-            prev_slim_logit = slim_pre[-1].clone()
+        prev_mid_logits = []
+        for i in range(n_mid_tiers):
+            if i < len(tier_skip_configs):
+                model.set_skip_layers(*tier_skip_configs[i])
+            mid_pre = _model_forward(model, input_ids, mid_pkv_list[i], slim_mode=True)
+            prev_mid_logits.append(mid_pre[-1].clone())
 
         if drafter_model is not None:
             drafter_device = next(drafter_model.parameters()).device
@@ -215,7 +270,7 @@ def via_sd_forward(
             prev_draft_logit = d_pre.logits[0, -1].clone()
         else:
             drafter_pkv = None
-            prev_draft_logit = prev_slim_logit if num_tiers >= 3 else prev_full_logit
+            prev_draft_logit = prev_mid_logits[0] if n_mid_tiers > 0 else prev_full_logit
 
     drafter_cur_len = input_ids.shape[1]    # tracks drafter KV length
 
@@ -254,11 +309,14 @@ def via_sd_forward(
                     cur_logit = d_out.logits[0, -1].clone()
                 else:
                     # Self-draft: slim mode on full model
+                    if n_mid_tiers > 0 and 0 < len(tier_skip_configs):
+                        model.set_skip_layers(*tier_skip_configs[0])
+                    draft_cache = mid_pkv_list[0] if n_mid_tiers > 0 else full_pkv
+                    draft_slim_mode = n_mid_tiers > 0
                     cur_logit = _model_forward(
-                        model, x_t_t.to(device), slim_pkv, slim_mode=True
+                        model, x_t_t.to(device), draft_cache, slim_mode=draft_slim_mode
                     )[-1].clone()
 
-        drafter_cur_len_after_draft = drafter_cur_len + gamma
         draft_token_num += gamma
 
         # Early EOS in draft
@@ -273,14 +331,18 @@ def via_sd_forward(
         # ── Verification phase: batch process all draft tokens ─────────────────
         with torch.inference_mode():
             full_prev_len = full_len_data[0].item()
-            slim_prev_len = slim_len_data[0].item() if num_tiers >= 3 else 0
+            mid_prev_lens = [x[0].item() for x in mid_len_data_list]
 
             # full_logits[t]  = full model distribution for draft_tokens[t+1]
             # full_logits[-1] = bonus distribution (after all draft tokens)
             full_logits = _model_forward(model, draft_ids, full_pkv, slim_mode=False)
 
-            if num_tiers >= 3:
-                slim_logits = _model_forward(model, draft_ids, slim_pkv, slim_mode=True)
+            mid_logits_by_tier = []
+            for i in range(n_mid_tiers):
+                if i < len(tier_skip_configs):
+                    model.set_skip_layers(*tier_skip_configs[i])
+                mid_logits = _model_forward(model, draft_ids, mid_pkv_list[i], slim_mode=True)
+                mid_logits_by_tier.append(mid_logits)
 
         # ── Three-tier acceptance ─────────────────────────────────────────────
         #   Verification logit mapping (off-by-one from the KV cache perspective):
@@ -297,21 +359,21 @@ def via_sd_forward(
             # Select verification logits for position t
             if t == 0:
                 full_logit_t = prev_full_logit.to(device)
-                slim_logit_t = prev_slim_logit.to(device) if num_tiers >= 3 else full_logit_t
+                mid_logit_ts = [m.to(device) for m in prev_mid_logits]
             else:
                 full_logit_t = full_logits[t - 1]
-                slim_logit_t = slim_logits[t - 1] if num_tiers >= 3 else full_logit_t
+                mid_logit_ts = [mid_logits[t - 1] for mid_logits in mid_logits_by_tier]
 
             full_p  = _softmax(full_logit_t)
-            slim_p  = _softmax(slim_logit_t)
             draft_p = draft_probs[t].to(device)
 
             if num_tiers == 2:
                 # Standard 2-tier SD: accept iff full model also picks x_t (greedy)
                 target_tok = full_p.argmax().item()
             else:
-                # VIA-SD: three-tier target distribution (Eq.14)
-                target_p   = _three_tier_target(slim_p, full_p, draft_p, alpha1, alpha2)
+                # VIA-SD: multi-tier hierarchical target
+                mid_probs = [_softmax(x) for x in mid_logit_ts]
+                target_p = _multi_tier_target(mid_probs, full_p, draft_p, alpha_list)
                 target_tok = target_p.argmax().item()
 
             if target_tok == x_t:
@@ -330,8 +392,8 @@ def via_sd_forward(
         #   The verification forward passes wrote gamma_act positions.
         #   Keep only accept_length of them.
         full_len_data.fill_(full_prev_len + accept_length)
-        if num_tiers >= 3:
-            slim_len_data.fill_(slim_prev_len + accept_length)
+        for i in range(n_mid_tiers):
+            mid_len_data_list[i].fill_(mid_prev_lens[i] + accept_length)
 
         # ── KV cache rollback (HF drafter) ────────────────────────────────────
         if drafter_model is not None:
@@ -344,9 +406,12 @@ def via_sd_forward(
             full_next = _model_forward(model, next_t, full_pkv, slim_mode=False)
             prev_full_logit = full_next[-1].clone()
 
-            if num_tiers >= 3:
-                slim_next = _model_forward(model, next_t, slim_pkv, slim_mode=True)
-                prev_slim_logit = slim_next[-1].clone()
+            prev_mid_logits = []
+            for i in range(n_mid_tiers):
+                if i < len(tier_skip_configs):
+                    model.set_skip_layers(*tier_skip_configs[i])
+                mid_next = _model_forward(model, next_t, mid_pkv_list[i], slim_mode=True)
+                prev_mid_logits.append(mid_next[-1].clone())
 
             if drafter_model is not None:
                 d_next = drafter_model(
@@ -358,7 +423,7 @@ def via_sd_forward(
                 drafter_pkv = d_next.past_key_values
                 prev_draft_logit = d_next.logits[0, -1].clone().to(device)
             else:
-                prev_draft_logit = prev_slim_logit
+                prev_draft_logit = prev_mid_logits[0] if n_mid_tiers > 0 else prev_full_logit
 
         # ── Update drafter length tracker ─────────────────────────────────────
         drafter_cur_len += accept_length + 1   # accepted tokens + next_token
@@ -406,6 +471,13 @@ def _build_arg_parser():
                    help="Region B/C slim-verifier threshold (paper: 0.3)")
     p.add_argument("--skip-ratio",    type=float, default=0.45,
                    help="Slim-verifier layer skip ratio (paper: 45%%)")
+    p.add_argument("--skip-ratios",   type=str, default="",
+                   help="Comma-separated ratios for middle tiers, e.g. 0.45,0.60")
+    p.add_argument("--skip-search",   type=str, default="random",
+                   choices=["random", "bayes"],
+                   help="How to choose skip layers for each middle tier")
+    p.add_argument("--bayes-init-points", type=int, default=6,
+                   help="Initial random points for bayesian skip search")
     p.add_argument("--num-gpus",      type=int, default=1)
     return p
 
@@ -429,14 +501,64 @@ def main():
     model.eval()
 
     # ── Configure slim-verifier skip layers ───────────────────────────────────
-    if args.num_tiers >= 3:
+    n_mid_tiers = max(0, args.num_tiers - 2)
+    tier_skip_configs = []
+    skip_ratios = _parse_comma_floats(args.skip_ratios)
+    if not skip_ratios:
+        skip_ratios = [args.skip_ratio + 0.15 * i for i in range(n_mid_tiers)]
+    if len(skip_ratios) < n_mid_tiers:
+        skip_ratios.extend([skip_ratios[-1]] * (n_mid_tiers - len(skip_ratios)))
+    skip_ratios = skip_ratios[:n_mid_tiers]
+
+    if n_mid_tiers > 0:
         n = model.config.num_hidden_layers
-        n_skip = int((n - 2) * 2 * args.skip_ratio)
-        attn_skip, mlp_skip = layer_random_search(num_skip_layers=n_skip,
-                                                   num_hidden_layers=n)
-        model.set_skip_layers(attn_skip, mlp_skip)
-        logging.info(f"Slim-verifier skip: {len(attn_skip)} attn + {len(mlp_skip)} mlp "
-                     f"(ratio={args.skip_ratio:.0%})")
+        if args.skip_search == "bayes":
+            from bayes_opt import BayesianOptimization
+            import inspect as _inspect
+            _new_api = "acquisition_function" in _inspect.signature(
+                BayesianOptimization.__init__).parameters
+            pbounds = {f"x{i}": (0.0, 1.0) for i in range((n - 2) * 2)}
+
+        tier_skip_configs = []
+        for idx in range(n_mid_tiers):
+            ratio_i = max(0.0, min(1.0, skip_ratios[idx]))
+            n_skip = int((n - 2) * 2 * ratio_i)
+            if args.skip_search == "bayes":
+                if _new_api:
+                    from bayes_opt.acquisition import UpperConfidenceBound
+                    acq = UpperConfidenceBound(kappa=2.5 + idx * 0.3)
+                    optimizer = BayesianOptimization(
+                        f=None,
+                        pbounds=pbounds,
+                        random_state=idx + 1,
+                        verbose=0,
+                        allow_duplicate_points=True,
+                        acquisition_function=acq,
+                    )
+                    utility = None
+                else:
+                    from bayes_opt import UtilityFunction
+                    optimizer = BayesianOptimization(
+                        f=None, pbounds=pbounds, random_state=idx + 1,
+                        verbose=0, allow_duplicate_points=True,
+                    )
+                    utility = UtilityFunction(kind="ucb", kappa=2.5 + idx * 0.3, xi=0.0)
+                # Bootstrap observations so Bayes suggest is meaningful.
+                for _ in range(args.bayes_init_points):
+                    a_tmp, m_tmp = layer_random_search(num_skip_layers=n_skip, num_hidden_layers=n)
+                    probe = get_next_point_to_probe(a_tmp, m_tmp, n)
+                    score = float(ratio_i)  # neutral prior anchored by desired ratio
+                    optimizer.register(params=probe, target=score)
+                _, attn_skip, mlp_skip = layer_bayes_search(
+                    optimizer, utility, num_skip_layers=n_skip, num_hidden_layers=n
+                )
+            else:
+                attn_skip, mlp_skip = layer_random_search(num_skip_layers=n_skip, num_hidden_layers=n)
+            tier_skip_configs.append((attn_skip, mlp_skip))
+            logging.info(
+                f"Middle tier {idx+1}: ratio={ratio_i:.0%}, "
+                f"skip={len(attn_skip)} attn + {len(mlp_skip)} mlp ({args.skip_search})"
+            )
 
     # ── Load drafter model ────────────────────────────────────────────────────
     drafter_model = None
@@ -461,7 +583,7 @@ def main():
     logging.info(f"Output → {answer_file}")
 
     # ── Run evaluation ────────────────────────────────────────────────────────
-    from evaluation_llama.eval_qa import run_eval_qa
+    from eval_qa import run_eval_qa
 
     forward_fn = functools.partial(
         via_sd_forward,
@@ -470,6 +592,8 @@ def main():
         alpha2=args.alpha2,
         gamma=args.gamma,
         num_tiers=args.num_tiers,
+        alpha_list=[args.alpha1, args.alpha2] + [0.2, 0.1],
+        tier_skip_configs=tier_skip_configs if n_mid_tiers > 0 else None,
     )
 
     run_eval_qa(
