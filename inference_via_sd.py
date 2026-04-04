@@ -152,10 +152,37 @@ def _truncate_hf_pkv(pkv, target_seq_len: int):
     """
     if pkv is None:
         return None
-    return tuple(
-        (k[..., :target_seq_len, :], v[..., :target_seq_len, :])
-        for k, v in pkv
-    )
+
+    # Transformers new cache API (e.g. DynamicCache)
+    if hasattr(pkv, "crop"):
+        pkv.crop(target_seq_len)
+        return pkv
+    if hasattr(pkv, "to_legacy_cache"):
+        legacy = pkv.to_legacy_cache()
+        return _truncate_hf_pkv(legacy, target_seq_len)
+
+    def _truncate_tensor(t):
+        if not torch.is_tensor(t):
+            return t
+        if t.dim() >= 3:
+            # expected shape [..., seq, head_dim]
+            return t[..., :target_seq_len, :]
+        return t
+
+    truncated_layers = []
+    for layer in pkv:
+        if isinstance(layer, (tuple, list)):
+            if len(layer) >= 2:
+                k = _truncate_tensor(layer[0])
+                v = _truncate_tensor(layer[1])
+                rest = tuple(layer[2:]) if len(layer) > 2 else tuple()
+                truncated_layers.append((k, v, *rest))
+            else:
+                truncated_layers.append(tuple(_truncate_tensor(x) for x in layer))
+        else:
+            truncated_layers.append(_truncate_tensor(layer))
+
+    return tuple(truncated_layers)
 
 
 def _model_forward(
