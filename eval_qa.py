@@ -191,11 +191,12 @@ def get_model_answers_qa(
         gen_ids = output_ids[0][input_ids.shape[1]:]
         output_text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
-        # Rejection rate r (paper definition)
-        r = (
+        # accepted_ratio = net accepted draft tokens / total draft tokens
+        accepted_ratio = (
             (sum(accept_lengths) - len(accept_lengths)) / draft_token_num
             if draft_token_num > 0 else 0.0
         )
+        rejection_rate = 1.0 - accepted_ratio
 
         accept_lengths_all.extend(accept_lengths)
         draft_token_num_all += draft_token_num
@@ -209,7 +210,8 @@ def get_model_answers_qa(
                 "wall_time": [wall_time],
                 "decoding_steps": [int(step)],
                 "accept_lengths": accept_lengths,
-                "acceptance_rate": float(r),
+                "acceptance_rate": float(accepted_ratio),
+                "rejection_rate": float(rejection_rate),
             }],
             "tstamp": time.time(),
         }
@@ -218,15 +220,17 @@ def get_model_answers_qa(
 
     # ── Summary ───────────────────────────────────────────────────────────────
     if accept_lengths_all:
-        overall_r = (
+        overall_accept_ratio = (
             (sum(accept_lengths_all) - len(accept_lengths_all)) / draft_token_num_all
             if draft_token_num_all > 0 else 0.0
         )
+        overall_reject_rate = 1.0 - overall_accept_ratio
         summary = {
             "model_id": model_id,
             "task": task_name,
             "mean_accept_length": float(np.mean(accept_lengths_all)),
-            "overall_acceptance_rate_r": float(overall_r),
+            "overall_acceptance_rate": float(overall_accept_ratio),
+            "overall_rejection_rate_r": float(overall_reject_rate),
             "total_draft_tokens": int(draft_token_num_all),
             "n_samples": len(accept_lengths_all),
         }
@@ -234,7 +238,7 @@ def get_model_answers_qa(
             f.write(json.dumps(summary) + "\n")
         logging.info(
             f"[{model_id}] {task_name}  "
-            f"r={overall_r:.3f}  "
+            f"r={overall_reject_rate:.3f}  "
             f"mean_accept={np.mean(accept_lengths_all):.2f}  "
             f"n={len(data)}"
         )
