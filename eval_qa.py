@@ -18,6 +18,7 @@ import logging
 import os
 import random
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -38,7 +39,13 @@ def seed_everything(seed: int = 42):
 
 # ── dataset loading ────────────────────────────────────────────────────────────
 
-def load_qa_data(task_name: str, seed: int, data_num: int):
+def load_qa_data(
+    task_name: str,
+    seed: int,
+    data_num: int,
+    local_dataset_root: str = "",
+    local_dataset_map: dict | None = None,
+):
     """
     Load a QA or generation dataset and return (records, prompt_prefix).
 
@@ -47,33 +54,52 @@ def load_qa_data(task_name: str, seed: int, data_num: int):
         data        : list of dataset records
         prompt_shots: few-shot prefix string (empty for QA tasks)
     """
-    logging.info(f"Loading dataset '{task_name}' (n={data_num}, seed={seed})")
+    limit_desc = "all" if data_num is None or data_num <= 0 else str(data_num)
+    logging.info(f"Loading dataset '{task_name}' (n={limit_desc}, seed={seed})")
+
+    def _shuffle_and_limit(ds):
+        ds = ds.shuffle(seed=seed)
+        if data_num is not None and data_num > 0:
+            ds = ds.select(range(min(data_num, len(ds))))
+        return list(ds)
+
+    local_dataset_map = local_dataset_map or {}
+    local_path = local_dataset_map.get(task_name, "")
+    if not local_path and local_dataset_root:
+        local_path = str(Path(local_dataset_root) / task_name)
+    if local_path:
+        p = Path(local_path)
+        if p.exists():
+            parquet_files = sorted(str(x) for x in p.rglob("*.parquet"))
+            if parquet_files:
+                logging.info(f"Loading local parquet dataset for {task_name}: {local_path}")
+                raw = load_dataset("parquet", data_files=parquet_files, split="train")
+                return _shuffle_and_limit(raw), ""
+            logging.warning(f"Local path exists but no parquet found: {local_path}")
+        else:
+            logging.warning(f"Local path not found, fallback to remote dataset: {local_path}")
 
     if task_name == "webquestions":
         raw = load_dataset("web_questions", split="test", trust_remote_code=True)
-        raw = raw.shuffle(seed=seed).select(range(min(data_num, len(raw))))
-        data = list(raw)
+        data = _shuffle_and_limit(raw)
         return data, ""
 
     elif task_name == "nq":
         # natural_questions validation split (test labels are private)
         raw = load_dataset("natural_questions", split="validation",
                            trust_remote_code=True)
-        raw = raw.shuffle(seed=seed).select(range(min(data_num, len(raw))))
-        data = list(raw)
+        data = _shuffle_and_limit(raw)
         return data, ""
 
     elif task_name == "triviaqa":
         raw = load_dataset("trivia_qa", "rc", split="validation",
                            trust_remote_code=True)
-        raw = raw.shuffle(seed=seed).select(range(min(data_num, len(raw))))
-        data = list(raw)
+        data = _shuffle_and_limit(raw)
         return data, ""
 
     elif task_name == "cnndm":
         n_shot = 1
-        raw   = load_dataset("cnn_dailymail", "3.0.0", split="test"
-                             ).shuffle(seed=seed).select(range(data_num))
+        raw = load_dataset("cnn_dailymail", "3.0.0", split="test")
         shots = load_dataset("cnn_dailymail", "3.0.0", split="train"
                              ).shuffle(seed=seed).select(range(n_shot))
         prompt_shots = ""
@@ -82,16 +108,15 @@ def load_qa_data(task_name: str, seed: int, data_num: int):
                 "Article: " + s["article"] +
                 "\nSummary: " + s["highlights"].replace("\n", "") + "\n"
             )
-        return list(raw), prompt_shots
+        return _shuffle_and_limit(raw), prompt_shots
 
     elif task_name == "xsum":
-        raw = load_dataset("xsum", split="test").shuffle(seed=seed).select(range(data_num))
-        return list(raw), ""
+        raw = load_dataset("xsum", split="test")
+        return _shuffle_and_limit(raw), ""
 
     elif task_name == "wmt14":
-        raw = load_dataset("wmt14", "de-en", split="test"
-                           ).shuffle(seed=seed).select(range(data_num))
-        return list(raw), ""
+        raw = load_dataset("wmt14", "de-en", split="test")
+        return _shuffle_and_limit(raw), ""
 
     else:
         raise ValueError(f"Unknown task: {task_name}")
@@ -252,8 +277,10 @@ def run_eval_qa(
     answer_file: str,
     max_new_tokens: int,
     task_name: str,
-    data_num: int = 200,
+    data_num: int = -1,
     seed: int = 42,
+    local_dataset_root: str = "",
+    local_dataset_map: dict | None = None,
     **kwargs,
 ):
     """
@@ -266,7 +293,13 @@ def run_eval_qa(
                     task_name="webquestions", data_num=200)
     """
     seed_everything(seed)
-    data, prompt_shots = load_qa_data(task_name, seed, data_num)
+    data, prompt_shots = load_qa_data(
+        task_name,
+        seed,
+        data_num,
+        local_dataset_root=local_dataset_root,
+        local_dataset_map=local_dataset_map,
+    )
 
     get_model_answers_qa(
         model=model,

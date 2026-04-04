@@ -457,8 +457,17 @@ def _build_arg_parser():
     p.add_argument("--task-name",     type=str, required=True,
                    choices=["webquestions", "nq", "triviaqa",
                             "cnndm", "xsum", "wmt14"])
-    p.add_argument("--data-num",      type=int, default=200)
+    p.add_argument("--data-num",      type=int, default=-1,
+                   help="Number of samples to run; <=0 means full dataset")
     p.add_argument("--seed",          type=int, default=42)
+    p.add_argument("--local-dataset-root", type=str, default="",
+                   help="Optional local dataset root. If set, tries <root>/<task-name>/*.parquet")
+    p.add_argument("--webquestions-local-path", type=str, default="",
+                   help="Optional local parquet directory for webquestions")
+    p.add_argument("--nq-local-path", type=str, default="",
+                   help="Optional local parquet directory for natural questions")
+    p.add_argument("--triviaqa-local-path", type=str, default="",
+                   help="Optional local parquet directory for triviaqa")
     p.add_argument("--dtype",         type=str, default="bfloat16",
                    choices=list(_DTYPE_MAP))
     p.add_argument("--num-tiers",     type=int, default=3,
@@ -606,6 +615,12 @@ def main():
         task_name=args.task_name,
         data_num=args.data_num,
         seed=args.seed,
+        local_dataset_root=args.local_dataset_root,
+        local_dataset_map={
+            "webquestions": args.webquestions_local_path,
+            "nq": args.nq_local_path,
+            "triviaqa": args.triviaqa_local_path,
+        },
     )
 
 
