@@ -2,9 +2,8 @@
 Compute Table 1 / Table 2 / Figure 2 metrics from jsonl output files.
 
 Metrics (paper definitions):
-  r  = rejection rate = (sum(accept_lengths) - len(accept_lengths)) / total_draft_tokens
-         equivalently: (accepted_tokens) / (draft_tokens)
-         where accepted_tokens = sum of net-accepted per step (accept_lengths - 1 per step)
+  accepted_ratio = (sum(accept_lengths) - len(accept_lengths)) / total_draft_tokens
+  r (rejection rate) = 1 - accepted_ratio
 
   τ  = speedup = mean_tokens_per_sec(method) / mean_tokens_per_sec(baseline AR)
 
@@ -83,20 +82,24 @@ def compute_speed_metrics(method_path: str, base_path: str, data_num: int = None
 
         accept_lengths_all.extend(mc.get("accept_lengths", []))
 
-    # Acceptance rate r from stored value (or recompute from accept_lengths)
+    # Rejection rate r from stored value (or derive from acceptance rate / accept_lengths)
     r_values = [
-        d["choices"][0].get("acceptance_rate", None)
+        d["choices"][0].get("rejection_rate", None)
         for d in method_data[:n]
-        if d["choices"][0].get("acceptance_rate") is not None
+        if d["choices"][0].get("rejection_rate") is not None
     ]
     if r_values:
         r_mean = float(np.mean(r_values))
-    elif accept_lengths_all:
-        # Fallback: approximate from mean accept length
-        # r ≈ (mean_accept_length - 1) / gamma  (paper Eq.)
-        r_mean = float(np.mean(accept_lengths_all) - 1)
     else:
-        r_mean = float("nan")
+        acc_values = [
+            d["choices"][0].get("acceptance_rate", None)
+            for d in method_data[:n]
+            if d["choices"][0].get("acceptance_rate") is not None
+        ]
+        if acc_values:
+            r_mean = float(1.0 - np.mean(acc_values))
+        else:
+            r_mean = float("nan")
 
     tau = float(np.mean(method_speeds) / np.mean(base_speeds)) if base_speeds else float("nan")
 
@@ -252,7 +255,7 @@ def main():
         m = compute_speed_metrics(args.method_file, args.base_file, args.data_num)
         print("\n── Single-pair metrics ──────────────────────────────────")
         print(f"  τ (speedup):           {m['tau']:.4f}×")
-        print(f"  r (acceptance rate):   {m['r']:.4f}")
+        print(f"  r (rejection rate):    {m['r']:.4f}")
         print(f"  mean accept length:    {m['mean_accept_len']:.2f}")
         print(f"  method tokens/sec:     {m['method_tok_per_sec']:.2f}")
         print(f"  baseline tokens/sec:   {m['base_tok_per_sec']:.2f}")
