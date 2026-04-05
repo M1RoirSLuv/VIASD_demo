@@ -45,6 +45,8 @@ def load_qa_data(
     data_num: int,
     local_dataset_root: str = "",
     local_dataset_map: dict | None = None,
+    shard_id: int = 0,
+    num_shards: int = 1,
 ):
     """
     Load a QA or generation dataset and return (records, prompt_prefix).
@@ -54,14 +56,24 @@ def load_qa_data(
         data        : list of dataset records
         prompt_shots: few-shot prefix string (empty for QA tasks)
     """
+    if num_shards <= 0:
+        raise ValueError(f"num_shards must be >=1, got {num_shards}")
+    if not (0 <= shard_id < num_shards):
+        raise ValueError(f"shard_id must be in [0, {num_shards-1}], got {shard_id}")
+
     limit_desc = "all" if data_num is None or data_num <= 0 else str(data_num)
-    logging.info(f"Loading dataset '{task_name}' (n={limit_desc}, seed={seed})")
+    logging.info(
+        f"Loading dataset '{task_name}' (n={limit_desc}, seed={seed}, shard={shard_id}/{num_shards})"
+    )
 
     def _shuffle_and_limit(ds):
         ds = ds.shuffle(seed=seed)
         if data_num is not None and data_num > 0:
             ds = ds.select(range(min(data_num, len(ds))))
-        return list(ds)
+        rows = list(ds)
+        if num_shards > 1:
+            rows = rows[shard_id::num_shards]
+        return rows
 
     local_dataset_map = local_dataset_map or {}
     local_path = local_dataset_map.get(task_name, "")
@@ -281,6 +293,8 @@ def run_eval_qa(
     seed: int = 42,
     local_dataset_root: str = "",
     local_dataset_map: dict | None = None,
+    shard_id: int = 0,
+    num_shards: int = 1,
     **kwargs,
 ):
     """
@@ -299,6 +313,8 @@ def run_eval_qa(
         data_num,
         local_dataset_root=local_dataset_root,
         local_dataset_map=local_dataset_map,
+        shard_id=shard_id,
+        num_shards=num_shards,
     )
 
     get_model_answers_qa(

@@ -486,6 +486,10 @@ def _build_arg_parser():
                             "cnndm", "xsum", "wmt14"])
     p.add_argument("--data-num",      type=int, default=-1,
                    help="Number of samples to run; <=0 means full dataset")
+    p.add_argument("--shard-id",      type=int, default=0,
+                   help="Shard index for dataset parallelism (0-based)")
+    p.add_argument("--num-shards",    type=int, default=1,
+                   help="Total number of dataset shards/processes")
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--local-dataset-root", type=str, default="",
                    help="Optional local dataset root. If set, tries <root>/<task-name>/*.parquet")
@@ -648,6 +652,8 @@ def main():
             "nq": args.nq_local_path,
             "triviaqa": args.triviaqa_local_path,
         },
+        shard_id=args.shard_id,
+        num_shards=args.num_shards,
     )
 
 
